@@ -94,6 +94,52 @@ ccusage codex session --json
 
 Session JSON includes per-model breakdowns, cached token counts, `lastActivity`, and `isFallback` flags for events that required either the legacy `gpt-5` pricing fallback or the manually curated `codex-auto-review` timeline.
 
+### Compare Conversation and Workstream Usage
+
+Run the accounting mode to separate each thread's own usage from inherited parent history:
+
+```bash
+ccusage codex session --accounting --json
+```
+
+The report groups threads by explicit parent relationships. Fork links appear separately and do not assign threads to a parent family. Token totals measure recorded usage; they do not establish completed tasks or successful outcomes.
+
+| JSON field | Reported data |
+| ---------- | ------------- |
+| `threads` | Each thread reports `ownUsage`, parent and fork identifiers, and `accounting` metrics. |
+| `families` | Each family reports root `ownThreadUsage`, combined `descendantUsage`, and `totalUsage`. |
+| `workstreams` | Each workstream reports usage from explicitly mapped threads. |
+| `totals` | The totals combine usage and accounting metrics across all threads. |
+| `coverage` | Coverage reports removed duplicate events, counter observations, and unmatched mapped thread IDs. |
+| `semantics` | The semantics specify grouping, pricing, and coverage rules. |
+
+Each accounting object reports `pricedTokens`, `unpricedTokens`, `knownCostUSD`, and `costPerMillionPricedTokens`. `costUSD` is `null` when any usage lacks pricing. A model without reliable attribution appears as `null` in `models` and contributes unpriced tokens. Requests with cache creation, or cached input without an explicit cache-read rate, also contribute all their tokens to unpriced usage. Reasoning tokens are included in output usage.
+
+Coverage includes inherited replay, repeated counters, resets, cumulative gaps, and unresolved initial counters. Accounting excludes initial or reset cumulative counters when the latest-request count is missing. Coverage counter values measure observed baselines and anomalies; they are not additional usage. Date filters apply to usage. Metadata and coverage describe all scanned files.
+
+Assign threads to workstreams with an explicit JSON map. Each key identifies a canonical thread ID, and each value must be a nonempty workstream string. The map parser accepts nonempty strings and reports IDs absent from the scanned threads:
+
+```json
+{
+	"00000000-0000-4000-8000-000000000001": "example-project/issue-42",
+	"00000000-0000-4000-8000-000000000002": "example-project/issue-42"
+}
+```
+
+```bash
+ccusage codex session --accounting --json --workstream-map ./workstreams.json
+```
+
+Only mapped threads contribute to workstream totals. Mapping a parent does not assign its descendants to that workstream.
+
+Accounting mode requires `--json` or `--jq` and cannot be combined with `--id`. For example, select conversation families directly:
+
+```bash
+ccusage codex session --accounting --jq '.families'
+```
+
+Cost estimates use the existing pricing source, pricing overrides, and speed policy. API estimates do not measure subscription payments.
+
 Have feedback or ideas? [Open an issue](https://github.com/ccusage/ccusage/issues/new) so we can improve Codex support.
 
 ## Troubleshooting

@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cell::RefCell,
     fs,
     io::{BufRead, BufReader},
     path::Path,
@@ -63,6 +64,22 @@ enum CodexLineKind {
 struct CodexExecTimestamps {
     event: String,
     model: String,
+}
+
+pub(crate) enum CodexAccountingObservation {
+    CanonicalMetadata {
+        source_session_id: String,
+        thread_id: Option<String>,
+        parent_thread_id: Option<String>,
+        forked_from_id: Option<String>,
+        history_base_thread_id: Option<String>,
+    },
+    UsageCoverage {
+        source_session_id: String,
+        timestamp: Option<String>,
+        kind: String,
+        tokens: Option<CodexRawUsage>,
+    },
 }
 
 /// Tracks how far a forked session's leading events still match the history it
@@ -157,14 +174,40 @@ pub(super) fn visit_codex_session_file(
     sessions_dir: &Path,
     path: &Path,
     replayed_prefix: Option<&[CodexRawUsage]>,
-    mut visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+    visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
 ) -> Result<()> {
+    visit_codex_session_file_internal(sessions_dir, path, replayed_prefix, visit, |_| {}, false)
+}
+
+pub(super) fn visit_codex_session_file_with_diagnostics(
+    sessions_dir: &Path,
+    path: &Path,
+    replayed_prefix: Option<&[CodexRawUsage]>,
+    visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+    observe: impl FnMut(CodexAccountingObservation),
+) -> Result<()> {
+    visit_codex_session_file_internal(sessions_dir, path, replayed_prefix, visit, observe, true)
+}
+
+fn visit_codex_session_file_internal(
+    sessions_dir: &Path,
+    path: &Path,
+    replayed_prefix: Option<&[CodexRawUsage]>,
+    mut visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+    mut observe: impl FnMut(CodexAccountingObservation),
+    diagnostics_enabled: bool,
+) -> Result<()> {
+    let session_id = codex_session_id(sessions_dir, path);
     let Ok(file) = fs::File::open(path) else {
+        if diagnostics_enabled {
+            observe_coverage(&mut observe, &session_id, None, "read_or_parse_error", None);
+        }
         return Ok(());
     };
     let mut reader = BufReader::with_capacity(128 * 1024, file);
     let mut line = Vec::new();
-    let session_id = codex_session_id(sessions_dir, path);
+    let observer = RefCell::new(&mut observe);
+    let mut metadata_observed = false;
     let mut previous_totals: Option<CodexRawUsage> = None;
     let mut current_model: Option<String> = None;
     let mut current_model_is_fallback = false;
@@ -189,6 +232,15 @@ pub(super) fn visit_codex_session_file(
                         total_tokens: event.total_tokens,
                     };
                     if prefix.get(index) == Some(&usage) {
+                        if diagnostics_enabled {
+                            observe_coverage(
+                                &mut **observer.borrow_mut(),
+                                &session_id,
+                                Some(event.timestamp.clone()),
+                                "inherited_replay",
+                                Some(usage),
+                            );
+                        }
                         replay = CodexReplayState::MatchingParent {
                             prefix,
                             index: index + 1,
@@ -211,6 +263,22 @@ pub(super) fn visit_codex_session_file(
                         && (0..=CODEX_REWRITTEN_BURST_PAUSE_MS)
                             .contains(&(timestamp.as_millis() - previous.as_millis()))
                     {
+                        if diagnostics_enabled {
+                            observe_coverage(
+                                &mut **observer.borrow_mut(),
+                                &session_id,
+                                Some(event.timestamp.clone()),
+                                "inherited_replay",
+                                Some(CodexRawUsage {
+                                    input_tokens: event.input_tokens,
+                                    cached_input_tokens: event.cached_input_tokens,
+                                    cache_creation_tokens: event.cache_creation_tokens,
+                                    output_tokens: event.output_tokens,
+                                    reasoning_output_tokens: event.reasoning_output_tokens,
+                                    total_tokens: event.total_tokens,
+                                }),
+                            );
+                        }
                         replay = CodexReplayState::SkippingRewrittenBurst(timestamp);
                         return Ok(());
                     }
@@ -224,10 +292,42 @@ pub(super) fn visit_codex_session_file(
     loop {
         line.clear();
         let Ok(bytes_read) = reader.read_until(b'\n', &mut line) else {
+            if diagnostics_enabled {
+                observe_coverage(
+                    &mut **observer.borrow_mut(),
+                    &session_id,
+                    None,
+                    "read_or_parse_error",
+                    None,
+                );
+            }
             return Ok(());
         };
         if bytes_read == 0 {
             break;
+        }
+        if diagnostics_enabled
+            && !metadata_observed
+            && memchr::memmem::find(&line, b"session_meta").is_some()
+            && let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && value.get("type").and_then(Value::as_str) == Some("session_meta")
+        {
+            metadata_observed = true;
+            let payload = value.get("payload");
+            let read_id = |pointer: &str| {
+                payload
+                    .and_then(|payload| payload.pointer(pointer))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            observer.borrow_mut()(CodexAccountingObservation::CanonicalMetadata {
+                source_session_id: session_id.clone(),
+                thread_id: read_id("/id"),
+                parent_thread_id: read_id("/parent_thread_id")
+                    .or_else(|| read_id("/source/subagent/thread_spawn/parent_thread_id")),
+                forked_from_id: read_id("/forked_from_id"),
+                history_base_thread_id: read_id("/history_base/thread_id"),
+            });
         }
         let Some(line_kind) = codex_line_usage_kind(&line) else {
             continue;
@@ -235,8 +335,25 @@ pub(super) fn visit_codex_session_file(
         match line_kind {
             CodexLineKind::Session => {
                 let Ok(value) = serde_json::from_slice::<CodexSessionLogEntry<'_>>(&line) else {
+                    if diagnostics_enabled {
+                        observe_coverage(
+                            &mut **observer.borrow_mut(),
+                            &session_id,
+                            None,
+                            "read_or_parse_error",
+                            None,
+                        );
+                    }
                     continue;
                 };
+                if diagnostics_enabled {
+                    observe_session_counters(
+                        &session_id,
+                        &value,
+                        previous_totals.as_ref(),
+                        &mut **observer.borrow_mut(),
+                    );
+                }
                 visit_codex_session_entry(
                     &session_id,
                     value,
@@ -272,6 +389,135 @@ pub(super) fn visit_codex_session_file(
     }
 
     Ok(())
+}
+
+fn observe_coverage(
+    observe: &mut impl FnMut(CodexAccountingObservation),
+    source_session_id: &str,
+    timestamp: Option<String>,
+    kind: &str,
+    tokens: Option<CodexRawUsage>,
+) {
+    observe(CodexAccountingObservation::UsageCoverage {
+        source_session_id: source_session_id.to_string(),
+        timestamp,
+        kind: kind.to_string(),
+        tokens,
+    });
+}
+
+fn contradictory_usage(usage: &CodexRawUsage) -> bool {
+    usage.input_tokens.checked_add(usage.output_tokens) != Some(usage.total_tokens)
+        || usage.cached_input_tokens > usage.input_tokens
+        || usage.cache_creation_tokens
+            > usage.input_tokens.saturating_sub(usage.cached_input_tokens)
+        || usage.reasoning_output_tokens > usage.output_tokens
+}
+
+fn observe_session_counters(
+    session_id: &str,
+    value: &CodexSessionLogEntry<'_>,
+    previous: Option<&CodexRawUsage>,
+    observe: &mut impl FnMut(CodexAccountingObservation),
+) {
+    if value.entry_type.as_deref() != Some("event_msg") {
+        return;
+    }
+    let Some(payload) = value.payload.as_ref() else {
+        return;
+    };
+    if payload.payload_type.as_deref() != Some("token_count") {
+        return;
+    }
+    let timestamp = codex_session_timestamp(value.timestamp.as_ref());
+    let Some(info) = payload.info.as_ref() else {
+        return;
+    };
+    let total = info.total_token_usage.as_ref();
+    let last = info.last_token_usage.as_ref();
+    if total.is_some_and(contradictory_usage) || last.is_some_and(contradictory_usage) {
+        observe_coverage(
+            observe,
+            session_id,
+            timestamp.clone(),
+            "contradictory_counter",
+            total.copied().or(last.copied()),
+        );
+    }
+    let Some(total) = total else {
+        return;
+    };
+    if let Some(previous) = previous {
+        if total.input_tokens >= previous.input_tokens
+            && total.output_tokens >= previous.output_tokens
+            && (total.cached_input_tokens < previous.cached_input_tokens
+                || total.cache_creation_tokens < previous.cache_creation_tokens
+                || total.reasoning_output_tokens < previous.reasoning_output_tokens)
+        {
+            observe_coverage(
+                observe,
+                session_id,
+                timestamp.clone(),
+                "subset_counter_correction",
+                Some(*total),
+            );
+        }
+        if total == previous {
+            observe_coverage(
+                observe,
+                session_id,
+                timestamp,
+                "repeated_counter",
+                last.copied(),
+            );
+        } else if total.input_tokens < previous.input_tokens
+            || total.output_tokens < previous.output_tokens
+            || total.total_tokens < previous.total_tokens
+        {
+            observe_coverage(
+                observe,
+                session_id,
+                timestamp,
+                "counter_reset",
+                Some(*total),
+            );
+            if last.is_none() {
+                observe_coverage(
+                    observe,
+                    session_id,
+                    codex_session_timestamp(value.timestamp.as_ref()),
+                    "unresolved_counter_reset_without_last",
+                    Some(*total),
+                );
+            }
+        } else if let Some(last) = last {
+            let delta = subtract_codex_raw_usage(total, Some(previous));
+            if delta.input_tokens >= last.input_tokens
+                && delta.output_tokens >= last.output_tokens
+                && delta.total_tokens > last.total_tokens
+            {
+                observe_coverage(
+                    observe,
+                    session_id,
+                    timestamp,
+                    "cumulative_gap",
+                    Some(subtract_codex_raw_usage(&delta, Some(last))),
+                );
+            }
+        }
+    } else if total.total_tokens > last.map_or(0, |last| last.total_tokens) {
+        observe_coverage(
+            observe,
+            session_id,
+            timestamp,
+            if last.is_none() {
+                "unresolved_initial_counter_without_last"
+            } else {
+                "unresolved_initial_counter"
+            },
+            Some(subtract_codex_raw_usage(total, last)),
+        );
+    }
 }
 
 fn visit_codex_session_entry(
@@ -1104,6 +1350,83 @@ fn normalize_codex_raw_usage(mut usage: CodexRawUsage) -> CodexRawUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccusage_test_support::fs_fixture;
+
+    fn accounting_observations(
+        records: &[Value],
+    ) -> (Vec<CodexTokenUsageEvent>, Vec<CodexAccountingObservation>) {
+        let content = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        let fixture = fs_fixture! {{ "session.jsonl": content }};
+        let mut events = Vec::new();
+        let mut observations = Vec::new();
+        visit_codex_session_file_with_diagnostics(
+            fixture.root(),
+            &fixture.path("session.jsonl"),
+            None,
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+            |observation| observations.push(observation),
+        )
+        .unwrap();
+        (events, observations)
+    }
+
+    fn counter_record(input: u64, output: u64, cached: u64) -> Value {
+        serde_json::json!({ "type":"event_msg", "timestamp":"2026-01-01T00:00:00Z", "payload": { "type":"token_count", "info": { "total_token_usage": { "input_tokens":input, "output_tokens":output, "cached_input_tokens":cached }, "last_token_usage": { "input_tokens":input, "output_tokens":output, "cached_input_tokens":cached } } } })
+    }
+
+    fn coverage_count(observations: &[CodexAccountingObservation], expected: &str) -> usize {
+        observations.iter().filter(|observation| matches!(observation, CodexAccountingObservation::UsageCoverage { kind, .. } if kind == expected)).count()
+    }
+
+    #[test]
+    fn accounting_observer_uses_first_metadata() {
+        let (_, observations) = accounting_observations(&[
+            serde_json::json!({"type":"session_meta","payload":{"id":"child"}}),
+            serde_json::json!({"type":"session_meta","payload":{"id":"parent"}}),
+        ]);
+        let identifiers = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                CodexAccountingObservation::CanonicalMetadata { thread_id, .. } => {
+                    thread_id.as_deref()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(identifiers, ["child"]);
+    }
+
+    #[test]
+    fn accounting_observer_reports_repeated_counter_once() {
+        let (events, observations) =
+            accounting_observations(&[counter_record(10, 1, 5), counter_record(10, 1, 5)]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(coverage_count(&observations, "repeated_counter"), 1);
+    }
+
+    #[test]
+    fn accounting_observer_distinguishes_cached_correction_from_reset() {
+        let (_, observations) =
+            accounting_observations(&[counter_record(100, 10, 80), counter_record(200, 20, 50)]);
+        assert_eq!(coverage_count(&observations, "counter_reset"), 0);
+        assert_eq!(
+            coverage_count(&observations, "subset_counter_correction"),
+            1
+        );
+    }
+
+    #[test]
+    fn accounting_observer_reports_primary_reset() {
+        let (_, observations) =
+            accounting_observations(&[counter_record(100, 10, 80), counter_record(10, 1, 5)]);
+        assert_eq!(coverage_count(&observations, "counter_reset"), 1);
+    }
 
     #[test]
     fn maps_recorded_service_tier_spellings() {

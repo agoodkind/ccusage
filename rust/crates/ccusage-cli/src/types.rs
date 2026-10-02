@@ -180,6 +180,8 @@ pub struct AgentCommandArgs {
     pub pi_path: Option<String>,
     pub open_claw_path: Option<String>,
     pub codex_speed: CodexSpeed,
+    pub codex_accounting: bool,
+    pub codex_workstream_map: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

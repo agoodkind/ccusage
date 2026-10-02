@@ -234,7 +234,7 @@ fn read_codex_session_file(
     events
 }
 
-fn dedupe_codex_events(events: &mut Vec<CodexTokenUsageEvent>) {
+pub(super) fn dedupe_codex_events(events: &mut Vec<CodexTokenUsageEvent>) {
     let mut indexes = FxHashMap::<_, usize>::default();
     let mut deduped = Vec::<CodexTokenUsageEvent>::with_capacity(events.len());
     for event in events.drain(..) {

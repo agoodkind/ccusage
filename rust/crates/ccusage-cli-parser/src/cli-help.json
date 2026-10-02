@@ -162,6 +162,16 @@
 			"default": "5"
 		}
 	],
+	"codex_accounting_options": [
+		{
+			"flags": "--accounting",
+			"description": "Report thread, conversation, and workstream accounting; requires --json or --jq"
+		},
+		{
+			"flags": "--workstream-map <path>",
+			"description": "Read explicit thread-to-workstream mappings; requires --accounting"
+		}
+	],
 	"codex_options": [
 		{
 			"flags": "-j, --json",

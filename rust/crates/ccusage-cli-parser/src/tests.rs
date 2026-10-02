@@ -1325,6 +1325,95 @@ fn rejects_codex_id_filter_outside_session_report() {
 }
 
 #[test]
+fn parses_codex_accounting_workstream_map() {
+    let cli = parse(&[
+        "ccusage",
+        "codex",
+        "session",
+        "--accounting",
+        "--json",
+        "--workstream-map",
+        "workstreams.json",
+    ]);
+    let Some(Command::Codex(args)) = cli.command else {
+        panic!("expected codex accounting command");
+    };
+    assert!(args.codex_accounting);
+    assert_eq!(
+        args.codex_workstream_map.as_deref(),
+        Some("workstreams.json")
+    );
+}
+
+#[test]
+fn rejects_codex_accounting_without_json() {
+    let error = parse_error(&["ccusage", "codex", "session", "--accounting"]);
+    assert_eq!(error, "Codex accounting requires --json or --jq.");
+}
+
+#[test]
+fn parses_codex_accounting_with_jq() {
+    let Some(Command::Codex(args)) = parse(&[
+        "ccusage",
+        "codex",
+        "session",
+        "--accounting",
+        "--jq",
+        ".totals",
+    ])
+    .command
+    else {
+        panic!("expected codex accounting command");
+    };
+    assert!(args.codex_accounting);
+    assert_eq!(args.shared.jq.as_deref(), Some(".totals"));
+}
+
+#[test]
+fn accounting_help_ignores_workstream_map_value() {
+    let help = help_text_for_args(
+        &[
+            "ccusage",
+            "codex",
+            "session",
+            "--workstream-map",
+            "daily",
+            "--help",
+        ]
+        .map(String::from),
+    );
+    assert!(help.contains("ccusage codex session <OPTIONS>"));
+    assert!(help.contains("--accounting"));
+}
+
+#[test]
+fn rejects_workstream_map_without_accounting() {
+    let error = parse_error(&[
+        "ccusage",
+        "codex",
+        "session",
+        "--json",
+        "--workstream-map",
+        "map.json",
+    ]);
+    assert_eq!(error, "The --workstream-map option requires --accounting.");
+}
+
+#[test]
+fn rejects_codex_accounting_with_session_id() {
+    let error = parse_error(&[
+        "ccusage",
+        "codex",
+        "session",
+        "--json",
+        "--accounting",
+        "--id",
+        "thread",
+    ]);
+    assert_eq!(error, "Codex accounting cannot be combined with --id.");
+}
+
+#[test]
 fn parses_opencode_weekly_options() {
     let cli = parse(&["ccusage", "opencode", "weekly", "--json"]);
     let Some(Command::OpenCode(args)) = cli.command else {

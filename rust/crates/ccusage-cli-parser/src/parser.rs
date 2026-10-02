@@ -47,6 +47,8 @@ impl RootAllOptions {
             pi_path: None,
             open_claw_path: None,
             codex_speed: CodexSpeed::Auto,
+            codex_accounting: false,
+            codex_workstream_map: None,
         }
     }
 }
@@ -426,6 +428,8 @@ fn parse_all_command(
         pi_path: None,
         open_claw_path: None,
         codex_speed: CodexSpeed::Auto,
+        codex_accounting: false,
+        codex_workstream_map: None,
     }))
 }
 
@@ -470,6 +474,8 @@ fn parse_top_level_session_command(
         pi_path: None,
         open_claw_path: None,
         codex_speed: CodexSpeed::Auto,
+        codex_accounting: false,
+        codex_workstream_map: None,
     }))
 }
 
@@ -610,6 +616,8 @@ fn parse_codex_command(
     let kind = parse_agent_report_kind(parser, "codex", STANDARD_AGENT_REPORTS)?;
     let mut codex_speed = CodexSpeed::Auto;
     let mut session_id = None;
+    let mut codex_accounting = false;
+    let mut codex_workstream_map = None;
     config.apply_agent_args(&mut codex_speed, None, None);
     while parser.peek().is_some() {
         if parse_shared_arg_for_command(parser, &mut shared)? {
@@ -617,10 +625,25 @@ fn parse_codex_command(
         }
         match parser.next_flag()?.as_str() {
             "--speed" => codex_speed = parse_codex_speed(&parser.value_for("--speed")?)?,
+            "--accounting" if kind == AgentReportKind::Session => codex_accounting = true,
+            "--workstream-map" if kind == AgentReportKind::Session => {
+                codex_workstream_map = Some(parser.value_for("--workstream-map")?);
+            }
             "-i" | "--id" if kind == AgentReportKind::Session => {
                 session_id = Some(parser.value_for("--id")?)
             }
             flag => return Err(format!("Unknown codex option '{flag}'")),
+        }
+    }
+    if codex_workstream_map.is_some() && !codex_accounting {
+        return Err("The --workstream-map option requires --accounting.".to_string());
+    }
+    if codex_accounting {
+        if !shared.json && shared.jq.is_none() {
+            return Err("Codex accounting requires --json or --jq.".to_string());
+        }
+        if session_id.is_some() {
+            return Err("Codex accounting cannot be combined with --id.".to_string());
         }
     }
     Ok(Command::Codex(AgentCommandArgs {
@@ -632,6 +655,8 @@ fn parse_codex_command(
         pi_path: None,
         open_claw_path: None,
         codex_speed,
+        codex_accounting,
+        codex_workstream_map,
     }))
 }
 
@@ -662,6 +687,8 @@ fn parse_pi_command(
         pi_path,
         open_claw_path: None,
         codex_speed,
+        codex_accounting: false,
+        codex_workstream_map: None,
     }))
 }
 
@@ -692,6 +719,8 @@ fn parse_openclaw_command(
         pi_path: None,
         open_claw_path,
         codex_speed,
+        codex_accounting: false,
+        codex_workstream_map: None,
     }))
 }
 
@@ -723,6 +752,8 @@ fn agent_command_args(shared: SharedArgs, kind: AgentReportKind) -> AgentCommand
         pi_path: None,
         open_claw_path: None,
         codex_speed: CodexSpeed::Auto,
+        codex_accounting: false,
+        codex_workstream_map: None,
     }
 }
 
@@ -940,6 +971,7 @@ fn option_takes_value(arg: &str) -> bool {
             | "--context-low-threshold"
             | "--context-medium-threshold"
             | "--speed"
+            | "--workstream-map"
             | "--pi-path"
             | "--open-claw-path"
             | "--sections"

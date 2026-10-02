@@ -60,6 +60,8 @@ fn main() -> Result<()> {
                 pi_path: None,
                 open_claw_path: None,
                 codex_speed: cli::CodexSpeed::Auto,
+                codex_accounting: false,
+                codex_workstream_map: None,
             };
             adapter::all::run(args)
         }

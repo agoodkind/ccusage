@@ -1,6 +1,7 @@
 use ccusage_adapter_common::{chunk_file_indexes_by_size, collect_usage_files};
 use ccusage_core::*;
 
+mod accounting;
 mod aggregate;
 mod loader;
 mod parser;
@@ -34,6 +35,13 @@ use crate::cli::{AgentReportKind, CodexSpeed, CostMode};
 use serde_json::Value;
 
 pub fn run(args: AgentCommandArgs) -> Result<()> {
+    if args.codex_accounting {
+        return accounting::run(
+            &args.shared,
+            args.codex_speed,
+            args.codex_workstream_map.as_deref(),
+        );
+    }
     let shared = args.shared;
     let pricing = PricingMap::load_with_overrides(
         shared.offline,
